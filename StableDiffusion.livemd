@@ -11,8 +11,7 @@ Mix.install(
     {:exla, ">= 0.0.0"},
     {:kino_bumblebee, "~> 0.1.0"}
   ],
-  config: [nx: [default_backend: EXLA.Backend]],
-  force: true
+  config: [nx: [default_backend: EXLA.Backend]]
 )
 ```
 
@@ -72,3 +71,9 @@ end
 ```
 
 That worked! If you got a CuDNN error in the last step (as I did), check your `XLA_TARGET` and make sure you haven't used one with too high a CuDNN. If so, downgrade your `XLA_TARGET` or upgrade CuDNN.
+
+## SD Inference broken down
+
+Now that we know the basics are working (which is a huge step since it means CUDA, XLA and Nx are all set up correctly), we're going to go a little deeper. Right now, a lot of the details of Stable Diffusion are hidden behind the `Bumblebee.Diffusion.StableDiffusion.text_to_image` function. We're going to break this function down into its parts in this notebook so we can start modifying the pieces in the next step.
+
+For this breakdown, we're going to ignore some of the unnecessary/less interesting bits like the safety checker.
