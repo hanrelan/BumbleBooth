@@ -13,6 +13,9 @@ Mix.install(
   ],
   config: [nx: [default_backend: EXLA.Backend]]
 )
+
+Nx.global_default_backend(EXLA.Backend)
+Nx.Defn.global_default_options(compiler: EXLA)
 ```
 
 ## Run SD inference with Nx.Serving
@@ -137,10 +140,14 @@ defmodule SDHelper do
   defn apply_guidance(noise_pred_uncond, noise_pred_cond, guidance_scale) do
     noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
   end
+
+  # TODO: remove this once https://github.com/elixir-nx/bumblebee/issues/123 lands in main
+  defn scheduler_step(step_fn, scheduler_state, latents, noise_pred) do
+    step_fn.(scheduler_state, latents, noise_pred)
+  end
 end
 
-{scheduler_state, timesteps} =
-  Bumblebee.Diffusion.PndmScheduler.init(scheduler, num_steps, latents_shape)
+{scheduler_state, timesteps} = Bumblebee.scheduler_init(scheduler, num_steps, latents_shape)
 
 unet_inputs = %{
   # One batch for uncond and one for cond_tokens
@@ -153,7 +160,99 @@ unet_inputs = %{
 noise_pred_uncond = noise_pred[0..(batch_size - 1)]
 noise_pred_cond = noise_pred[batch_size..-1//1]
 noise_pred = SDHelper.apply_guidance(noise_pred_uncond, noise_pred_cond, guidance_scale)
+scheduler_step_fn = &Bumblebee.scheduler_step(scheduler, &1, &2, &3)
 
 {_state, new_latents} =
-  Bumblebee.Diffusion.PndmScheduler.step(scheduler, scheduler_state, latents, noise_pred)
+  SDHelper.scheduler_step(scheduler_step_fn, scheduler_state, latents, noise_pred)
+```
+
+Now that we have our new latents after one step of the diffusion process, we can run them through the VAE to see what the image looks like. But we're not expecting much since it's just a single step.
+
+```elixir
+# Scaling before we pass it to the VAE
+new_latents = Nx.multiply(new_latents, 1 / 0.18215)
+%{sample: image} = Axon.predict(vae.model, vae.params, new_latents)
+images = NxImage.from_continuous(image, -1, 1)
+
+Kino.Layout.grid(
+  [
+    Kino.Image.new(images[0]),
+    Kino.Image.new(images[1])
+  ],
+  boxed: true,
+  columns: 2
+)
+```
+
+It's a brown mess but that's what we expected. Let's put this into a loop and run all 20 steps so we can get a real image. We'll use a `while` loop in `defn` for a performance gain. To do that, we'll have to use the pre-built versions of our models to avoid issues passing them into the `defn`
+
+```elixir
+{_, unet_predict} = Axon.build(unet.model, compiler: EXLA)
+{_, vae_predict} = Axon.build(vae.model, compiler: EXLA)
+
+defmodule SDLoop do
+  import Nx.Defn
+
+  defn run(
+         guidance_scale,
+         latents,
+         timesteps,
+         text_embeddings,
+         unet_predict,
+         unet_params,
+         scheduler_step_fn,
+         scheduler_state
+       ) do
+    {_, latents, _, _, _} =
+      while {scheduler_state, latents, unet_params, text_embeddings, guidance_scale},
+            timestep <- timesteps do
+        unet_inputs = %{
+          "sample" => Nx.concatenate([latents, latents]),
+          "timestep" => timestep,
+          "encoder_hidden_state" => text_embeddings
+        }
+
+        %{sample: noise_pred} = unet_predict.(unet_params, unet_inputs)
+        batch_size = div(Nx.axis_size(noise_pred, 0), 2)
+        noise_pred_uncond = noise_pred[0..(batch_size - 1)]
+        noise_pred_cond = noise_pred[batch_size..-1//1]
+        noise_pred = SDHelper.apply_guidance(noise_pred_uncond, noise_pred_cond, guidance_scale)
+
+        {scheduler_state, latents} =
+          SDHelper.scheduler_step(scheduler_step_fn, scheduler_state, latents, noise_pred)
+
+        {scheduler_state, latents, unet_params, text_embeddings, guidance_scale}
+      end
+
+    latents
+  end
+end
+
+new_latents =
+  SDLoop.run(
+    guidance_scale,
+    latents,
+    timesteps,
+    text_embeddings,
+    unet_predict,
+    unet.params,
+    scheduler_step_fn,
+    scheduler_state
+  )
+```
+
+```elixir
+# Scaling before we pass it to the VAE
+new_latents = Nx.multiply(new_latents, 1 / 0.18215)
+%{sample: image} = Axon.predict(vae.model, vae.params, new_latents)
+images = NxImage.from_continuous(image, -1, 1)
+
+Kino.Layout.grid(
+  [
+    Kino.Image.new(images[0]),
+    Kino.Image.new(images[1])
+  ],
+  boxed: true,
+  columns: 2
+)
 ```
