@@ -76,4 +76,84 @@ That worked! If you got a CuDNN error in the last step (as I did), check your `X
 
 Now that we know the basics are working (which is a huge step since it means CUDA, XLA and Nx are all set up correctly), we're going to go a little deeper. Right now, a lot of the details of Stable Diffusion are hidden behind the `Bumblebee.Diffusion.StableDiffusion.text_to_image` function. We're going to break this function down into its parts in this notebook so we can start modifying the pieces in the next step.
 
-For this breakdown, we're going to ignore some of the unnecessary/less interesting bits like the safety checker.
+For this breakdown, we're going to ignore some of the unnecessary/less interesting bits like the safety checker and doing multiple images per prompt.
+
+This breakdown is based on the code underlying [Bumblebee.Diffusion.StableDiffusion.text_to_image](https://github.com/elixir-nx/bumblebee/blob/main/lib/bumblebee/diffusion/stable_diffusion.ex) and [this notebook](https://github.com/fastai/diffusion-nbs/blob/master/Stable%20Diffusion%20Deep%20Dive.ipynb) from [fast.ai](https://fast.ai)
+
+Let's start by processing the prompt - in this case processing means turn the natural language text into text embeddings.
+
+The way SD works is we create outputs for two prompts: the conditional prompt which is the prompt we give it, and the unconditional prompt which is simply the empty string. The final result is a sort of weighted sum between these two results.
+
+```elixir
+prompt = Kino.Input.read(text_input)
+seq_length = 60
+batch_size = 2
+num_steps = 20
+guidance_scale = 7.5
+
+tokenizer_options = [
+  length: seq_length,
+  return_token_type_ids: false,
+  return_attention_mask: false
+]
+
+cond_tokens = Bumblebee.Text.ClipTokenizer.apply(tokenizer, prompt, tokenizer_options)
+uncond_tokens = Bumblebee.Text.ClipTokenizer.apply(tokenizer, "", tokenizer_options)
+# Since cond_tokens and uncond_tokens are maps, this concats the corresponding keys correctly
+tokens = Bumblebee.Utils.Nx.composite_concatenate(uncond_tokens, cond_tokens)
+%{hidden_state: text_embeddings} = Axon.predict(clip.model, clip.params, tokens)
+# Shape = {2, 60, 768}
+text_embeddings
+```
+
+We have the text embeddings for the conditional and unconditional prompt, but we need to replicate these to match our batch size. We're going to put our batch size in the *2nd* dimension so later we can easily split the output into the conditional and unconditional parts.
+
+```elixir
+text_embeddings =
+  text_embeddings
+  |> Nx.new_axis(1)
+  |> Nx.tile([1, batch_size, 1, 1])
+  |> Nx.reshape({:auto, seq_length, 768})
+```
+
+The final shape of `text_embeddings` is `{batch_size*2, 60, 768}` with the first batch of size batch_size being the embeddings for the empty prompt (unconditional) and the 2nd batch being the embeddings for our target prompt (conditional).
+
+Next, we'll create our starting random latent vectors, one for each generation we're going to do. For this model, we can look at the spec to determine these are 64x64x4 tensors. So our final output is going to have shape `{batch_size, 64, 64, 4}`, one latent for each image we're going to generate.
+
+```elixir
+latents_shape = {batch_size, unet.spec.sample_size, unet.spec.sample_size, unet.spec.in_channels}
+key = Nx.Random.key(0)
+{latents, _new_key} = Nx.Random.normal(key, shape: latents_shape)
+latents
+```
+
+Now we have all the pieces, we can do a single step of our eventual loop. We'll initialize the scheduler and then predict the in our current (totally noisy) latents. We can even try to visualize our outputs - though don't expect much... yet.
+
+```elixir
+defmodule SDHelper do
+  import Nx.Defn
+
+  # We need this in a module so we can use use `Nx.Defn` so the operators work
+  defn apply_guidance(noise_pred_uncond, noise_pred_cond, guidance_scale) do
+    noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+  end
+end
+
+{scheduler_state, timesteps} =
+  Bumblebee.Diffusion.PndmScheduler.init(scheduler, num_steps, latents_shape)
+
+unet_inputs = %{
+  # One batch for uncond and one for cond_tokens
+  "sample" => Nx.concatenate([latents, latents]),
+  "timestep" => timesteps[0],
+  "encoder_hidden_state" => text_embeddings
+}
+
+%{sample: noise_pred} = Axon.predict(unet.model, unet.params, unet_inputs)
+noise_pred_uncond = noise_pred[0..(batch_size - 1)]
+noise_pred_cond = noise_pred[batch_size..-1//1]
+noise_pred = SDHelper.apply_guidance(noise_pred_uncond, noise_pred_cond, guidance_scale)
+
+{_state, new_latents} =
+  Bumblebee.Diffusion.PndmScheduler.step(scheduler, scheduler_state, latents, noise_pred)
+```
