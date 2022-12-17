@@ -11,8 +11,7 @@ Mix.install(
     {:exla, ">= 0.0.0"},
     {:kino_bumblebee, "~> 0.1.0"}
   ],
-  config: [nx: [default_backend: EXLA.Backend]],
-  force: true
+  config: [nx: [default_backend: EXLA.Backend]]
 )
 
 Nx.global_default_backend(EXLA.Backend)
@@ -205,7 +204,7 @@ defmodule SDLoop do
          scheduler_step_fn,
          scheduler_state
        ) do
-    {_, latents, _, _, _} =
+    {scheduler_state, latents, _, _, _} =
       while {scheduler_state, latents, unet_params, text_embeddings, guidance_scale},
             timestep <- timesteps do
         unet_inputs = %{
@@ -270,7 +269,29 @@ The advantage of breaking the model down like this is now we can use the additio
 It requires too much patience to wait while the image is being generated. Let's make it so we can see the intermediate results as they're generated.
 
 ```elixir
+Process.sleep(2000)
+
 frame = Kino.Frame.new() |> Kino.render()
+
+defmodule SDRenderer do
+  def render_latents(latents, vae, frame) do
+    latents = Nx.multiply(latents, 1 / 0.18215)
+    %{sample: image} = Axon.predict(vae.model, vae.params, latents)
+    images = NxImage.from_continuous(image, -1, 1)
+
+    image_grid =
+      Kino.Layout.grid(
+        [
+          Kino.Image.new(images[0]),
+          Kino.Image.new(images[1])
+        ],
+        boxed: true,
+        columns: 2
+      )
+
+    Kino.Frame.render(frame, image_grid)
+  end
+end
 
 chunked_timesteps =
   timesteps
@@ -278,35 +299,22 @@ chunked_timesteps =
   |> Enum.chunk_every(4)
   |> Enum.map(&Nx.tensor/1)
 
-Enum.reduce(chunked_timesteps, {scheduler_state, latents}, fn timesteps,
-                                                              {scheduler_state, latents} ->
-  {scheduler_state, latents} =
-    SDLoop.run(
-      guidance_scale,
-      latents,
-      timesteps,
-      text_embeddings,
-      unet_predict,
-      unet.params,
-      scheduler_step_fn,
-      scheduler_state
-    )
+{_, final_latents} =
+  Enum.reduce(chunked_timesteps, {scheduler_state, latents}, fn timesteps,
+                                                                {scheduler_state, latents} ->
+    {scheduler_state, latents} =
+      SDLoop.run(
+        guidance_scale,
+        latents,
+        timesteps,
+        text_embeddings,
+        unet_predict,
+        unet.params,
+        scheduler_step_fn,
+        scheduler_state
+      )
 
-  final_latents = Nx.multiply(latents, 1 / 0.18215)
-  %{sample: image} = Axon.predict(vae.model, vae.params, final_latents)
-  images = NxImage.from_continuous(image, -1, 1)
-
-  image_grid =
-    Kino.Layout.grid(
-      [
-        Kino.Image.new(images[0]),
-        Kino.Image.new(images[1])
-      ],
-      boxed: true,
-      columns: 2
-    )
-
-  Kino.Frame.render(frame, image_grid)
-  {scheduler_state, latents}
-end)
+    SDRenderer.render_latents(latents, vae, frame)
+    {scheduler_state, latents}
+  end)
 ```
