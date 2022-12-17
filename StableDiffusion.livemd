@@ -11,7 +11,8 @@ Mix.install(
     {:exla, ">= 0.0.0"},
     {:kino_bumblebee, "~> 0.1.0"}
   ],
-  config: [nx: [default_backend: EXLA.Backend]]
+  config: [nx: [default_backend: EXLA.Backend]],
+  force: true
 )
 
 Nx.global_default_backend(EXLA.Backend)
@@ -55,7 +56,8 @@ serving =
     safety_checker: safety_checker,
     safety_checker_featurizer: featurizer,
     compile: [batch_size: 1, sequence_length: 60],
-    defn_options: [compiler: EXLA]
+    defn_options: [compiler: EXLA],
+    seed: 0
   )
 
 text_input =
@@ -184,7 +186,7 @@ Kino.Layout.grid(
 )
 ```
 
-It's a brown mess but that's what we expected. Let's put this into a loop and run all 20 steps so we can get a real image. We'll use a `while` loop in `defn` for a performance gain. To do that, we'll have to use the pre-built versions of our models to avoid issues passing them into the `defn`
+It's a noisy mess but that's what we expected. Let's put this into a loop and run all 20 steps so we can get a real image. We'll use a `while` loop in `defn` for a performance gain. To do that, we'll have to use the pre-built versions of our models to avoid issues passing them into the `defn`
 
 ```elixir
 {_, unet_predict} = Axon.build(unet.model, compiler: EXLA)
@@ -224,11 +226,11 @@ defmodule SDLoop do
         {scheduler_state, latents, unet_params, text_embeddings, guidance_scale}
       end
 
-    latents
+    {scheduler_state, latents}
   end
 end
 
-new_latents =
+{_final_scheduler_state, final_latents} =
   SDLoop.run(
     guidance_scale,
     latents,
@@ -241,10 +243,12 @@ new_latents =
   )
 ```
 
+Now `final_latents` represents the latents for our image after many steps of the diffusion denoising process. Let's run them through the VAE to see what they look like.
+
 ```elixir
 # Scaling before we pass it to the VAE
-new_latents = Nx.multiply(new_latents, 1 / 0.18215)
-%{sample: image} = Axon.predict(vae.model, vae.params, new_latents)
+final_latents = Nx.multiply(final_latents, 1 / 0.18215)
+%{sample: image} = Axon.predict(vae.model, vae.params, final_latents)
 images = NxImage.from_continuous(image, -1, 1)
 
 Kino.Layout.grid(
@@ -255,4 +259,54 @@ Kino.Layout.grid(
   boxed: true,
   columns: 2
 )
+```
+
+Success! It matches our original generation using `Bumblebee` and `Nx.Serving` because we used the same seed of 0.
+
+The advantage of breaking the model down like this is now we can use the additional control to add features. Let's do that now.
+
+## Using our controllable SD inference
+
+It requires too much patience to wait while the image is being generated. Let's make it so we can see the intermediate results as they're generated.
+
+```elixir
+frame = Kino.Frame.new() |> Kino.render()
+
+chunked_timesteps =
+  timesteps
+  |> Nx.to_flat_list()
+  |> Enum.chunk_every(4)
+  |> Enum.map(&Nx.tensor/1)
+
+Enum.reduce(chunked_timesteps, {scheduler_state, latents}, fn timesteps,
+                                                              {scheduler_state, latents} ->
+  {scheduler_state, latents} =
+    SDLoop.run(
+      guidance_scale,
+      latents,
+      timesteps,
+      text_embeddings,
+      unet_predict,
+      unet.params,
+      scheduler_step_fn,
+      scheduler_state
+    )
+
+  final_latents = Nx.multiply(latents, 1 / 0.18215)
+  %{sample: image} = Axon.predict(vae.model, vae.params, final_latents)
+  images = NxImage.from_continuous(image, -1, 1)
+
+  image_grid =
+    Kino.Layout.grid(
+      [
+        Kino.Image.new(images[0]),
+        Kino.Image.new(images[1])
+      ],
+      boxed: true,
+      columns: 2
+    )
+
+  Kino.Frame.render(frame, image_grid)
+  {scheduler_state, latents}
+end)
 ```
