@@ -2,7 +2,7 @@
 An implementation of Dreambooth in Elixir using Stable Diffusion and BumbleBee.
 
 ## Notebooks
-`StableDiffusion.livemd` - Contains a breakdown of basic Stable Diffusion inference and Image-to-Image using SD
+[StableDiffusion.livemd](StableDiffusion.livemd) - Contains a breakdown of basic Stable Diffusion inference and Image-to-Image using SD
 
 ## Roadmap
 	* [x] SD inference running using the BumbleeBee example
