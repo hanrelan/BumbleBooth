@@ -48,6 +48,10 @@ repository_id = "CompVis/stable-diffusion-v1-4"
 ```
 
 ```elixir
+%Bumblebee.Diffusion.DdimScheduler{}
+```
+
+```elixir
 serving =
   Bumblebee.Diffusion.StableDiffusion.text_to_image(clip, unet, vae, tokenizer, scheduler,
     num_steps: 20,
@@ -269,26 +273,19 @@ The advantage of breaking the model down like this is now we can use the additio
 It requires too much patience to wait while the image is being generated. Let's make it so we can see the intermediate results as they're generated.
 
 ```elixir
-Process.sleep(2000)
-
 frame = Kino.Frame.new() |> Kino.render()
 
 defmodule SDRenderer do
-  def render_latents(latents, vae, frame) do
+  def render_latents(latents, vae) do
     latents = Nx.multiply(latents, 1 / 0.18215)
     %{sample: image} = Axon.predict(vae.model, vae.params, latents)
     images = NxImage.from_continuous(image, -1, 1)
+    Enum.map(0..(Nx.axis_size(images, 0) - 1), &Kino.Image.new(images[&1]))
+  end
 
-    image_grid =
-      Kino.Layout.grid(
-        [
-          Kino.Image.new(images[0]),
-          Kino.Image.new(images[1])
-        ],
-        boxed: true,
-        columns: 2
-      )
-
+  def render_latents(latents, vae, frame) do
+    kino_images = render_latents(latents, vae)
+    image_grid = Kino.Layout.grid(kino_images, boxed: true, columns: 2)
     Kino.Frame.render(frame, image_grid)
   end
 end
@@ -317,4 +314,194 @@ chunked_timesteps =
     SDRenderer.render_latents(latents, vae, frame)
     {scheduler_state, latents}
   end)
+```
+
+## Image-to-Image
+
+With controllable SD inference, we can try something new - image2image! First, we'll need both the VAE decoder and *encoder*. We already have the decoder from earlier, so let's load the encoder.
+
+```elixir
+vae_decoder = vae
+
+{:ok, vae_encoder} =
+  Bumblebee.load_model({:hf, repository_id, subdir: "vae"},
+    architecture: :encoder,
+    params_filename: "diffusion_pytorch_model.bin"
+  )
+
+:ok
+```
+
+Next we can use Kino to create a control for upload an image, which we'll center crop and then preprocess into the right `Nx` format.
+
+```elixir
+image = Kino.Input.image("Source image", size: {512, 512}, fit: :crop)
+```
+
+We need to extract the binary from the uploaded image, convert it to `Nx` in HWC format, put it into the range -1 to 1 instead of 0 to 255 and add a batch dimension.
+
+```elixir
+%{data: content, format: _, height: height, width: width} = Kino.Input.read(image)
+
+source_image =
+  Nx.from_binary(content, :u8)
+  |> Nx.reshape({height, width, 3})
+
+image_tensor =
+  source_image
+  |> NxImage.to_continuous(-1, 1)
+  |> Nx.new_axis(0)
+```
+
+The image tensor is ready to pass to our VAE. A VAE doesn't directly output the latents - instead it outputs the distribution from which we sample the latents, so we need a sampling function.
+
+```elixir
+sample = fn posterior ->
+  z = Nx.random_normal(Nx.shape(posterior.mean))
+  Nx.add(posterior.mean, Nx.multiply(posterior.std, z))
+end
+
+%{latent_dist: posterior} = Axon.predict(vae_encoder.model, vae_encoder.params, image_tensor)
+# Scale the latents
+latent = Nx.multiply(sample.(posterior), 0.18215)
+```
+
+We can make sure that we did everything right by running the decoder on our latent. We should get back our original image
+
+```elixir
+frame = Kino.Frame.new() |> Kino.render()
+SDRenderer.render_latents(latent, vae_decoder, frame)
+```
+
+Looks right! The way image2image works is, instead of starting with random latent like we did earlier, we're going to start with a noisy version of the latent for our source image (which we just calculated). So first, we need to add the right amount of noise to the image where the right amount is determined by the scheduler. Then we run the diffusion process and get our new image.
+
+To add the "right amount of noise", we'll have to use the scheduler to compute the noise. The function below is a port from the python [diffusers](https://github.com/huggingface/diffusers/blob/v0.10.2/src/diffusers/schedulers/scheduling_pndm.py#L401) library. We're going to use the `DdimScheduler` because it's simpler to understand.
+
+```elixir
+num_steps = 40
+
+scheduler = %Bumblebee.Diffusion.DdimScheduler{
+  beta_start: 0.00085,
+  beta_end: 0.012,
+  clip_denoised_sample: false,
+  alpha_clip_strategy: :alpha_zero
+}
+
+latents_shape = {1, unet.spec.sample_size, unet.spec.sample_size, unet.spec.in_channels}
+{scheduler_state, timesteps} = Bumblebee.scheduler_init(scheduler, num_steps, latents_shape)
+
+defmodule Noiser do
+  import Nx.Defn
+
+  defn add_noise(scheduler_state, original_samples, noise, timesteps) do
+    alpha_bars = scheduler_state.alpha_bars
+
+    sqrt_alpha_bars =
+      (alpha_bars[timesteps] ** 0.5)
+      |> Nx.flatten()
+      |> expand_dims(Nx.rank(original_samples))
+
+    sqrt_one_minus_alpha_bars =
+      ((1 - alpha_bars[timesteps]) ** 0.5)
+      |> Nx.flatten()
+      |> expand_dims(Nx.rank(original_samples))
+
+    sqrt_alpha_bars * original_samples + sqrt_one_minus_alpha_bars * noise
+  end
+
+  # Adds dimensions at the end until the tensor rank matches `rank`
+  defn expand_dims(tensor, rank) do
+    if Nx.rank(tensor) < rank do
+      expand_dims(Nx.new_axis(tensor, -1), rank)
+    else
+      tensor
+    end
+  end
+end
+
+sampling_step = 15
+key = Nx.Random.key(0)
+{noise, _new_key} = Nx.Random.normal(key, shape: latent)
+
+noisy_latent =
+  Noiser.add_noise(scheduler_state, latent, noise, Nx.new_axis(timesteps[sampling_step], 0))
+
+# Note how we have to update the scheduler_state to reflect we've "done" some iterations
+scheduler_state = %{scheduler_state | iteration: sampling_step}
+
+SDRenderer.render_latents(noisy_latent, vae_decoder, Kino.render(Kino.Frame.new()))
+```
+
+A noisy image! We set the `sampling_step` to 15, so it's as if we had already run the diffusion process for 15 steps and the `noisy_latent` was the result. Now we can run the remaning steps starting from step 15 to finish the diffusion process and get our new image.
+
+We'll also need new text embeddings to guide the process.
+
+```elixir
+im2im_text_input =
+  Kino.Input.text("Prompt", default: "numbat, forest, high quality, detailed, digital art")
+```
+
+```elixir
+defmodule SDEmbeddings do
+  def get_embeddings(text_input, clip, tokenizer, seq_length, batch_size) do
+    prompt = Kino.Input.read(text_input)
+
+    tokenizer_options = [
+      length: seq_length,
+      return_token_type_ids: false,
+      return_attention_mask: false
+    ]
+
+    cond_tokens = Bumblebee.Text.ClipTokenizer.apply(tokenizer, prompt, tokenizer_options)
+    uncond_tokens = Bumblebee.Text.ClipTokenizer.apply(tokenizer, "", tokenizer_options)
+    tokens = Bumblebee.Utils.Nx.composite_concatenate(uncond_tokens, cond_tokens)
+    %{hidden_state: text_embeddings} = Axon.predict(clip.model, clip.params, tokens)
+
+    text_embeddings
+    |> Nx.new_axis(1)
+    |> Nx.tile([1, batch_size, 1, 1])
+    |> Nx.reshape({:auto, seq_length, 768})
+  end
+end
+
+im2im_embeddings = SDEmbeddings.get_embeddings(im2im_text_input, clip, tokenizer, 60, 1)
+```
+
+```elixir
+scheduler_step_fn = &Bumblebee.scheduler_step(scheduler, &1, &2, &3)
+frame = Kino.Frame.new() |> Kino.render()
+render = &Kino.Frame.render(frame, Kino.Layout.grid(&1, boxed: true, columns: 2))
+source_image_kino = Kino.Image.new(source_image)
+render.([source_image_kino | SDRenderer.render_latents(noisy_latent, vae_decoder)])
+
+chunked_timesteps =
+  timesteps[sampling_step..-1//1]
+  |> Nx.to_flat_list()
+  |> Enum.chunk_every(4)
+  |> Enum.map(&Nx.tensor/1)
+
+{_, final_latents} =
+  Enum.reduce(chunked_timesteps, {scheduler_state, noisy_latent}, fn timesteps,
+                                                                     {scheduler_state, latents} ->
+    {scheduler_state, latents} =
+      SDLoop.run(
+        15,
+        latents,
+        timesteps,
+        im2im_embeddings,
+        unet_predict,
+        unet.params,
+        scheduler_step_fn,
+        scheduler_state
+      )
+
+    kino_images = SDRenderer.render_latents(latents, vae)
+
+    [source_image_kino | kino_images]
+    |> render.()
+
+    {scheduler_state, latents}
+  end)
+
+:ok
 ```
