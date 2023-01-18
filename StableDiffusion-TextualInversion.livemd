@@ -452,6 +452,8 @@ batch_step = fn batch, state ->
   %{key: new_key, clip_params: new_clip_params, optimizer_state: new_optim_state, loss: loss}
 end
 
+# WEIRD BEHAVIOR: If I put the below call in a separate cell, we run out of memory while training
+
 batch_step.(Enum.at(train_data, 0), %{
   key: Nx.Random.key(1),
   clip_params: clip.params,
