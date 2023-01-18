@@ -1,0 +1,574 @@
+# Stable Diffusion with Textual Inversion
+
+```elixir
+# This should be set appropriately for the system
+# eg. cuda118 for a machine with a GPU and CUDA 11.8+
+IO.puts(System.get_env("XLA_TARGET"))
+
+Mix.install(
+  [
+    {:bumblebee, github: "elixir-nx/bumblebee", branch: "main", override: true},
+    {:exla, ">= 0.0.0"},
+    {:kino_bumblebee, "~> 0.1.0"},
+    {:req, "~> 0.3"},
+    {:nx, github: "elixir-nx/nx", sparse: "nx", override: true},
+    {:stb_image, "~> 0.6.0"}
+  ],
+  config: [nx: [default_backend: EXLA.Backend]]
+)
+
+Nx.global_default_backend(EXLA.Backend)
+Nx.Defn.global_default_options(compiler: EXLA)
+```
+
+## Set up
+
+In this notebook, we're going to try to get Textual Inversion working in Elixir using Stable Diffusion. Textual Inversion is the process of training *just* the embedding for a particular concept. Essentially, we're trying to manipulate the elements of an embedding vector to have it represent the concept we want, and we do this by back propagating to the embedding until it's outputting the images we want.
+
+We'll be using [this tutorial](https://colab.research.google.com/github/huggingface/notebooks/blob/main/diffusers/sd_textual_inversion_training.ipynb) for Python to get our code working in Elixir.
+
+Textual inversion requires 3 - 5 images representing the concept we're trying to train, so let's go ahead and grab those. We're going to be finding an embedding for a weird cat toy.
+
+```elixir
+urls = [
+  "https://huggingface.co/datasets/valhalla/images/resolve/main/2.jpeg",
+  "https://huggingface.co/datasets/valhalla/images/resolve/main/3.jpeg",
+  "https://huggingface.co/datasets/valhalla/images/resolve/main/5.jpeg",
+  "https://huggingface.co/datasets/valhalla/images/resolve/main/6.jpeg"
+]
+
+images =
+  urls
+  |> Enum.map(fn url ->
+    url
+    |> Req.get!()
+    |> Map.get(:body)
+  end)
+
+images
+|> Enum.map(&Kino.Image.new(&1, :jpg))
+|> Kino.Layout.grid(columns: 2)
+```
+
+. **Note** we're going to do something slightly different from the tutorial we're following since it's currently not easy to add a token into the tokenzier in Elixir.
+
+So instead, we're going to *overwrite* the meaning of the starting token so it represents our cat toy.
+
+```elixir
+starting_token_input = Kino.Input.text("Starting token", default: "toy")
+```
+
+```elixir
+starting_token = Kino.Input.read(starting_token_input)
+```
+
+Let's load up the tokenizer and the rest of the models. We'll be using Stable Diffusion v1.4
+
+```elixir
+repository_id = "CompVis/stable-diffusion-v1-4"
+```
+
+```elixir
+{:ok, tokenizer} = Bumblebee.load_tokenizer({:hf, "openai/clip-vit-large-patch14"})
+tokenizer
+```
+
+```elixir
+{:ok, clip} = Bumblebee.load_model({:hf, repository_id, subdir: "text_encoder"})
+
+{:ok, unet} =
+  Bumblebee.load_model({:hf, repository_id, subdir: "unet"},
+    params_filename: "diffusion_pytorch_model.bin"
+  )
+
+# Comment this out to save memory
+# {:ok, vae_decoder} =
+#   Bumblebee.load_model({:hf, repository_id, subdir: "vae"},
+#     architecture: :decoder,
+#     params_filename: "diffusion_pytorch_model.bin"
+#   )
+
+{:ok, vae_encoder} =
+  Bumblebee.load_model({:hf, repository_id, subdir: "vae"},
+    architecture: :encoder,
+    params_filename: "diffusion_pytorch_model.bin"
+  )
+```
+
+## Dataset
+
+Let's set up our dataset. We'll resize the images to 512x512 and convert them into `Nx` tensors.
+
+```elixir
+imagenet_templates_small = [
+  "a photo of a {}",
+  "a rendering of a {}",
+  "a cropped photo of the {}",
+  "the photo of a {}",
+  "a photo of a clean {}",
+  "a photo of a dirty {}",
+  "a dark photo of the {}",
+  "a photo of my {}",
+  "a photo of the cool {}",
+  "a close-up photo of a {}",
+  "a bright photo of the {}",
+  "a cropped photo of a {}",
+  "a photo of the {}",
+  "a good photo of the {}",
+  "a photo of one {}",
+  "a close-up photo of the {}",
+  "a rendition of the {}",
+  "a photo of the clean {}",
+  "a rendition of a {}",
+  "a photo of a nice {}",
+  "a good photo of a {}",
+  "a photo of the nice {}",
+  "a photo of the small {}",
+  "a photo of the weird {}",
+  "a photo of the large {}",
+  "a photo of a cool {}",
+  "a photo of a small {}"
+]
+```
+
+```elixir
+images_512 =
+  Enum.map(images, fn image ->
+    image
+    |> StbImage.read_binary!()
+    |> StbImage.resize(512, 512)
+    |> StbImage.to_nx()
+    |> Nx.as_type(:u8)
+    |> NxImage.to_continuous(-1, 1)
+  end)
+```
+
+We're going to do some data augmentation by randomly flipping our images horizontally. Let's write a small helper for that
+
+```elixir
+defmodule Augmentation do
+  def h_flip(image) do
+    Nx.reverse(image, axes: [:width])
+  end
+end
+```
+
+Now let's create our dataset. Each epoch will be just 4 images, and for each image we'll randomly decide with 50% prob whether we want to flip it. The label will be a random choice from the template.
+
+```elixir
+images_stream =
+  Stream.map(images_512, fn image ->
+    if Enum.random([true, false]) do
+      Augmentation.h_flip(image)
+    else
+      image
+    end
+    |> Nx.new_axis(0)
+  end)
+```
+
+```elixir
+tokenizer
+```
+
+```elixir
+tokenizer_options = [
+  length: 77,
+  return_token_type_ids: false,
+  return_attention_mask: false
+]
+
+labels_stream =
+  Stream.repeatedly(fn ->
+    imagenet_templates_small
+    |> Enum.random()
+    |> String.replace_suffix("{}", starting_token)
+    |> then(fn prompt ->
+      Bumblebee.Text.ClipTokenizer.apply(tokenizer, prompt, tokenizer_options)
+    end)
+  end)
+
+Enum.at(labels_stream, 0)
+```
+
+```elixir
+train_data = Stream.zip(images_stream, labels_stream)
+Enum.to_list(train_data)
+```
+
+## Training loop
+
+Now the tricky part. We want to train the model, but we *only* want to train the embedding. Let's look at the params in the `clip` encoder (we're going to filter out the `"text_model.encoder"` because there's a lot of them) and see if we can find the token embeddings params.
+
+```elixir
+clip.params
+|> Map.keys()
+|> Enum.reject(&String.starts_with?(&1, "text_model.encoder"))
+```
+
+There it is - `text_model.embeddings.token_embedding`. There should be one tensor of size 768 for each token. Let's get the token id for our `starting_token`
+
+<!-- livebook:{"break_markdown":true} -->
+
+For some reason, `token_to_id` returns a different token from `apply`! I'll show the `token_to_id` here because it *should* work, but `apply` returns the correct token and we'll use that instead
+
+```elixir
+Bumblebee.Text.ClipTokenizer.token_to_id(tokenizer, starting_token) |> Kino.render()
+
+starting_token_id =
+  Bumblebee.Text.ClipTokenizer.apply(tokenizer, starting_token, tokenizer_options)["input_ids"][0][
+    1
+  ]
+  |> Kino.render()
+
+clip.params["text_model.embeddings.token_embedding"]["kernel"][starting_token_id]
+```
+
+We want to freeze everything except for the embeddings. Let's use `Axon.freeze` to do so. One tricky bit is that `Axon.freeze` uses parameter ids but doesn't give us the name. So we have to do a bit of sleuthing to get the ids of all the parameters of the `clip` model *except*  the token embeddings
+
+```elixir
+parameter_ids_to_freeze =
+  Axon.reduce_nodes(clip.model, [], fn %Axon.Node{name: name_fn, parameters: parameters}, acc ->
+    # The params don't matter
+    name = name_fn.(nil, nil)
+
+    if name != "text_model.embeddings.token_embedding" do
+      parameter_ids = Enum.map(parameters, & &1.id)
+      [parameter_ids | acc]
+    else
+      acc
+    end
+  end)
+  |> List.flatten()
+```
+
+```elixir
+frozen_vae_encoder = Axon.freeze(vae_encoder.model)
+# This isn't really necessary
+# frozen_vae_decoder = Axon.freeze(vae_decoder.model)
+frozen_unet = Axon.freeze(unet.model)
+
+frozen_clip =
+  Axon.freeze(clip.model, fn params ->
+    Enum.filter(params, fn %{id: id} ->
+      Enum.member?(parameter_ids_to_freeze, id)
+    end)
+  end)
+```
+
+Now we have what we need for a training loop. We'll have to write our own step function. Some of this is extracted from the [Stable Diffusion using Bumblebee](https://github.com/hanrelan/BumbleBooth/blob/main/StableDiffusion.livemd) notebook, so check that out as well if you haven't already.
+
+```elixir
+max_steps = 2000
+num_epochs = trunc(max_steps / (train_data |> Enum.to_list() |> Enum.count())) |> Kino.render()
+batch_size = 1
+```
+
+```elixir
+defmodule Noiser do
+  import Nx.Defn
+
+  defn add_noise(scheduler_state, original_samples, noise, timesteps) do
+    alpha_bars = scheduler_state.alpha_bars
+
+    sqrt_alpha_bars =
+      (alpha_bars[timesteps] ** 0.5)
+      |> Nx.flatten()
+      |> expand_dims(Nx.rank(original_samples))
+
+    sqrt_one_minus_alpha_bars =
+      ((1 - alpha_bars[timesteps]) ** 0.5)
+      |> Nx.flatten()
+      |> expand_dims(Nx.rank(original_samples))
+
+    sqrt_alpha_bars * original_samples + sqrt_one_minus_alpha_bars * noise
+  end
+
+  # Adds dimensions at the end until the tensor rank matches `rank`
+  defn expand_dims(tensor, rank) do
+    if Nx.rank(tensor) < rank do
+      expand_dims(Nx.new_axis(tensor, -1), rank)
+    else
+      tensor
+    end
+  end
+end
+```
+
+```elixir
+# Don't think this is used during training
+num_timesteps = 50
+
+scheduler = %Bumblebee.Diffusion.DdimScheduler{
+  beta_start: 0.00085,
+  beta_end: 0.012,
+  clip_denoised_sample: false,
+  alpha_clip_strategy: :alpha_zero
+}
+
+latents_shape = {batch_size, unet.spec.sample_size, unet.spec.sample_size, unet.spec.in_channels}
+{scheduler_state, _timesteps} = Bumblebee.scheduler_init(scheduler, num_timesteps, latents_shape)
+scheduler
+```
+
+A lot of the craziness below is required to get stuff through the `defn` barrier. If anyone has ideas on how to fix it, please let me know!
+
+Other things I noticed:
+
+* `apply_updates` won't accept `nil` (won't get through `defn`) so we pass an empty state
+* `Axon.build` takes mode `:train` not `:training` contrary to docs
+
+```elixir
+{_, vae_encoder_predict} = Axon.build(frozen_vae_encoder, compiler: EXLA)
+{_, unet_predict} = Axon.build(frozen_unet, compiler: EXLA)
+{_, clip_predict} = Axon.build(frozen_clip, compiler: EXLA, mode: :train)
+
+defmodule TextualInversion do
+  import Nx.Defn
+
+  defn sample(posterior) do
+    z = Nx.random_normal(Nx.shape(posterior.mean))
+    Nx.add(posterior.mean, Nx.multiply(posterior.std, z))
+  end
+
+  defn objective_fn(
+         clip_params,
+         input_ids,
+         timesteps,
+         noise,
+         noisy_latents,
+         unet_predict,
+         unet_params,
+         clip_predict
+       ) do
+    %{prediction: %{hidden_state: encoder_hidden_states}} = clip_predict.(clip_params, input_ids)
+
+    %{sample: noise_pred} =
+      unet_predict.(unet_params, %{
+        "timestep" => timesteps,
+        "sample" => noisy_latents,
+        "encoder_hidden_state" => encoder_hidden_states
+      })
+
+    target = noise
+    # Axon.Losses.mean_squared_error and Pytorch MSELoss operate differently when reduction=:none
+    loss =
+      target
+      |> Nx.subtract(noise_pred)
+      |> Nx.power(2)
+      |> Nx.mean(axes: [1, 2, 3])
+      |> Nx.mean()
+
+    loss
+  end
+
+  defn get_loss_and_grad(
+         clip_params,
+         {images, text},
+         key,
+         vae_encoder_predict,
+         vae_encoder_params,
+         unet_predict,
+         unet_params,
+         scheduler_state,
+         clip_predict,
+         opts \\ []
+       ) do
+    scheduler = opts[:scheduler]
+    %{latent_dist: posteriors} = vae_encoder_predict.(vae_encoder_params, images)
+    latents = Nx.multiply(sample(posteriors), 0.18215)
+    # Sample noise that we'll add to the latents
+    {noise, new_key} = Nx.Random.normal(key, shape: latents)
+    batch_size = Nx.axis_size(latents, 0)
+    # Sample a random timestep for each image
+    {timesteps, new_key} =
+      Nx.Random.randint(new_key, 0, scheduler.num_train_steps, shape: {batch_size}, type: :u32)
+
+    # Add noise to the latents according to the noise magnitude at each timestep
+    # (this is the forward diffusion process)
+    noisy_latents = Noiser.add_noise(scheduler_state, latents, noise, timesteps)
+    # Get the text embedding for conditioning
+    %{"input_ids" => input_ids} = text
+
+    {loss, gradients} =
+      value_and_grad(
+        clip_params,
+        fn params ->
+          objective_fn(
+            params,
+            input_ids,
+            timesteps,
+            noise,
+            noisy_latents,
+            unet_predict,
+            unet_params,
+            clip_predict
+          )
+        end
+      )
+
+    {{loss, new_key}, gradients}
+  end
+end
+
+{init_fn, optimizer} = Axon.Optimizers.adamw(5.0e-4, decay: 0.01)
+# {init_fn, optimizer} = Axon.Optimizers.adamw(5.0e-5)
+initial_optim_state = init_fn.(clip.params)
+
+batch_step = fn batch, state ->
+  %{key: key, clip_params: clip_params, optimizer_state: optim_state} = state
+
+  {{loss, new_key}, gradients} =
+    TextualInversion.get_loss_and_grad(
+      clip_params,
+      batch,
+      key,
+      vae_encoder_predict,
+      vae_encoder.params,
+      unet_predict,
+      unet.params,
+      scheduler_state,
+      clip_predict,
+      scheduler: scheduler
+    )
+
+  {updates, new_optim_state} = optimizer.(gradients, optim_state, clip_params)
+  # Now we need to zero out all the updates in the text embedding except for our specific token
+  proper_updates =
+    Nx.broadcast(0.0, Nx.shape(updates["text_model.embeddings.token_embedding"]["kernel"]))
+    |> Nx.put_slice(
+      [Nx.to_number(starting_token_id), 0],
+      Nx.new_axis(
+        updates["text_model.embeddings.token_embedding"]["kernel"][starting_token_id],
+        0
+      )
+    )
+
+  proper_updates =
+    put_in(updates, ["text_model.embeddings.token_embedding", "kernel"], proper_updates)
+
+  # Apply updates seems to have a bug and require a state map
+  new_clip_params = Axon.Updates.apply_updates(clip_params, proper_updates, %{})
+  %{key: new_key, clip_params: new_clip_params, optimizer_state: new_optim_state, loss: loss}
+end
+
+batch_step.(Enum.at(train_data, 0), %{
+  key: Nx.Random.key(1),
+  clip_params: clip.params,
+  optimizer_state: initial_optim_state,
+  loss: 0.0
+})
+```
+
+```elixir
+
+```
+
+```elixir
+# render_example = fn clip_params ->
+#   clip = %{model: frozen_clip, params: clip_params}
+
+#   serving =
+#     Bumblebee.Diffusion.StableDiffusion.text_to_image(
+#       clip,
+#       unet,
+#       vae_decoder,
+#       tokenizer,
+#       scheduler,
+#       num_steps: 20,
+#       num_images_per_prompt: 2,
+#       safety_checker: nil,
+#       safety_checker_featurizer: nil,
+#       compile: [batch_size: 1, sequence_length: 60],
+#       defn_options: [compiler: EXLA],
+#       seed: 0
+#     )
+
+#   output = Nx.Serving.run(serving, "a grafitti in a favela wall with a toy on it")
+
+#   for result <- output.results do
+#     Kino.Image.new(result.image)
+#   end
+#   |> Kino.Layout.grid(columns: 2)
+# end
+
+# render_example.(clip.params)
+```
+
+Now we train!
+
+```elixir
+# frame = Kino.Frame.new() |> Kino.render()
+
+# renderer_handler = fn state ->
+#   Kino.Frame.append(frame, "Epoch: #{state.epoch}, Iteration: #{state.iteration}")
+#   clip_params = state.step_state[:clip_params]
+#   Kino.Frame.append(render_example.(clip_params))
+#   {:continue, state}
+# end
+
+# Axon.Loop.loop(batch_step)
+# |> Axon.Loop.handle(:epoch_completed, renderer_handler)
+# |> Axon.Loop.run(train_data, %{
+#   key: Nx.Random.key(0),
+#   clip_params: clip.params,
+#   optimizer_state: initial_optim_state,
+#   loss: 0.0
+# })
+```
+
+Never mind! Not sure why that doesn't work :(, but I guess we'll proceed without Axon. Now we train, round 2!
+
+```elixir
+initial_state = %{
+  key: Nx.Random.key(0),
+  clip_params: clip.params,
+  optimizer_state: initial_optim_state,
+  loss: 0.0
+}
+
+final_state =
+  Enum.reduce(1..trunc(num_epochs), initial_state, fn epoch, state ->
+    IO.puts("Epoch #{epoch}")
+    state = Enum.reduce(train_data, state, batch_step)
+
+    IO.inspect(
+      state[:clip_params]["text_model.embeddings.token_embedding"]["kernel"][starting_token_id]
+      |> Nx.sum()
+    )
+
+    # renderer_handler.(%{epoch: epoch, step_state: state})
+    state
+  end)
+```
+
+```elixir
+render_example = fn clip_params ->
+  clip = %{model: frozen_clip, params: clip_params}
+
+  serving =
+    Bumblebee.Diffusion.StableDiffusion.text_to_image(
+      clip,
+      unet,
+      vae_decoder,
+      tokenizer,
+      scheduler,
+      num_steps: 20,
+      num_images_per_prompt: 2,
+      safety_checker: nil,
+      safety_checker_featurizer: nil,
+      compile: [batch_size: 1, sequence_length: 60],
+      defn_options: [compiler: EXLA],
+      seed: 0
+    )
+
+  output = Nx.Serving.run(serving, "toy")
+
+  for result <- output.results do
+    Kino.Image.new(result.image)
+  end
+  |> Kino.Layout.grid(columns: 2)
+end
+
+render_example.(final_state[:clip_params])
+```

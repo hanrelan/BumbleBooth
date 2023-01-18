@@ -48,10 +48,6 @@ repository_id = "CompVis/stable-diffusion-v1-4"
 ```
 
 ```elixir
-%Bumblebee.Diffusion.DdimScheduler{}
-```
-
-```elixir
 serving =
   Bumblebee.Diffusion.StableDiffusion.text_to_image(clip, unet, vae, tokenizer, scheduler,
     num_steps: 20,
