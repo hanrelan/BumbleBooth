@@ -19,6 +19,10 @@ Mix.install(
 
 Nx.global_default_backend(EXLA.Backend)
 Nx.Defn.global_default_options(compiler: EXLA)
+IO.puts("exla version: #{Application.spec(:exla, :vsn)}")
+IO.puts("nx version: #{Application.spec(:nx, :vsn)}")
+IO.puts("bumblebee version: #{Application.spec(:bumblebee, :vsn)}")
+IO.puts("axon version: #{Application.spec(:axon, :vsn)}")
 ```
 
 ## Set up
@@ -66,6 +70,7 @@ Let's load up the tokenizer and the rest of the models. We'll be using Stable Di
 
 ```elixir
 repository_id = "CompVis/stable-diffusion-v1-4"
+# repository_id = "runwayml/stable-diffusion-v1-5"
 ```
 
 ```elixir
@@ -157,7 +162,10 @@ Now let's create our dataset. Each epoch will be just 4 images, and for each ima
 
 ```elixir
 images_stream =
-  Stream.map(images_512, fn image ->
+  images_512
+  # |> List.first
+  # |> then(fn i -> [i] end)
+  |> Stream.map(fn image ->
     if Enum.random([true, false]) do
       Augmentation.h_flip(image)
     else
@@ -226,35 +234,7 @@ clip.params["text_model.embeddings.token_embedding"]["kernel"][starting_token_id
 
 We want to freeze everything except for the embeddings. Let's use `Axon.freeze` to do so. One tricky bit is that `Axon.freeze` uses parameter ids but doesn't give us the name. So we have to do a bit of sleuthing to get the ids of all the parameters of the `clip` model *except*  the token embeddings
 
-```elixir
-parameter_ids_to_freeze =
-  Axon.reduce_nodes(clip.model, [], fn %Axon.Node{name: name_fn, parameters: parameters}, acc ->
-    # The params don't matter
-    name = name_fn.(nil, nil)
-
-    if name != "text_model.embeddings.token_embedding" do
-      parameter_ids = Enum.map(parameters, & &1.id)
-      [parameter_ids | acc]
-    else
-      acc
-    end
-  end)
-  |> List.flatten()
-```
-
-```elixir
-frozen_vae_encoder = Axon.freeze(vae_encoder.model)
-# This isn't really necessary
-# frozen_vae_decoder = Axon.freeze(vae_decoder.model)
-frozen_unet = Axon.freeze(unet.model)
-
-frozen_clip =
-  Axon.freeze(clip.model, fn params ->
-    Enum.filter(params, fn %{id: id} ->
-      Enum.member?(parameter_ids_to_freeze, id)
-    end)
-  end)
-```
+<!-- livebook:{"break_markdown":true} -->
 
 Now we have what we need for a training loop. We'll have to write our own step function. Some of this is extracted from the [Stable Diffusion using Bumblebee](https://github.com/hanrelan/BumbleBooth/blob/main/StableDiffusion.livemd) notebook, so check that out as well if you haven't already.
 
@@ -316,39 +296,74 @@ A lot of the craziness below is required to get stuff through the `defn` barrier
 Other things I noticed:
 
 * `apply_updates` won't accept `nil` (won't get through `defn`) so we pass an empty state
-* `Axon.build` takes mode `:train` not `:training` contrary to docs
 
 ```elixir
-{_, vae_encoder_predict} = Axon.build(frozen_vae_encoder, compiler: EXLA)
-{_, unet_predict} = Axon.build(frozen_unet, compiler: EXLA)
-{_, clip_predict} = Axon.build(frozen_clip, compiler: EXLA, mode: :train)
+token_embedding =
+  clip.params["text_model.embeddings.token_embedding"]["kernel"][starting_token_id]
+
+token_embedding |> Nx.sum()
+```
+
+```elixir
+{init_fn, optimizer} = Axon.Optimizers.adamw(5.0e-4, decay: 0.01)
+# {init_fn, optimizer} = Axon.Optimizers.adamw(5.0e-5)
+initial_optim_state = init_fn.(%{"token_embedding" => token_embedding})
+```
+
+```elixir
+{_, vae_encoder_predict} = Axon.build(vae_encoder.model, compiler: EXLA)
+{_, unet_predict} = Axon.build(unet.model, compiler: EXLA)
+{_, clip_predict} = Axon.build(clip.model, mode: :train, compiler: EXLA)
 
 defmodule TextualInversion do
   import Nx.Defn
 
-  defn sample(posterior) do
-    z = Nx.random_normal(Nx.shape(posterior.mean))
-    Nx.add(posterior.mean, Nx.multiply(posterior.std, z))
+  defn insert_embedding(clip_params, token_embedding, token_id) do
+    new_token_embeddings_kernel =
+      clip_params["text_model.embeddings.token_embedding"]["kernel"]
+      |> Nx.put_slice([token_id, 0], Nx.new_axis(token_embedding, 0))
+
+    new_token_embeddings = %{
+      clip_params["text_model.embeddings.token_embedding"]
+      | "kernel" => new_token_embeddings_kernel
+    }
+
+    new_clip_params = %{
+      clip_params
+      | "text_model.embeddings.token_embedding" => new_token_embeddings
+    }
+
+    new_clip_params
+  end
+
+  defn sample(key, posterior) do
+    {z, new_key} = Nx.Random.normal(key, shape: Nx.shape(posterior.mean))
+    {Nx.add(posterior.mean, Nx.multiply(posterior.std, z)), new_key}
   end
 
   defn objective_fn(
-         clip_params,
+         token_embedding,
+         token_id,
          input_ids,
          timesteps,
          noise,
          noisy_latents,
          unet_predict,
          unet_params,
-         clip_predict
+         clip_predict,
+         clip_params
        ) do
+    clip_params = insert_embedding(clip_params, token_embedding, token_id)
     %{prediction: %{hidden_state: encoder_hidden_states}} = clip_predict.(clip_params, input_ids)
-
+    # encoder_hidden_states = encoder_hidden_states |> print_value(label: "encoder hidden states")
     %{sample: noise_pred} =
       unet_predict.(unet_params, %{
         "timestep" => timesteps,
         "sample" => noisy_latents,
         "encoder_hidden_state" => encoder_hidden_states
       })
+
+    # noise_pred = noise_pred |> print_value(label: "noise pred")
 
     target = noise
     # Axon.Losses.mean_squared_error and Pytorch MSELoss operate differently when reduction=:none
@@ -363,7 +378,8 @@ defmodule TextualInversion do
   end
 
   defn get_loss_and_grad(
-         clip_params,
+         token_embedding,
+         token_id,
          {images, text},
          key,
          vae_encoder_predict,
@@ -372,13 +388,15 @@ defmodule TextualInversion do
          unet_params,
          scheduler_state,
          clip_predict,
+         clip_params,
          opts \\ []
        ) do
     scheduler = opts[:scheduler]
     %{latent_dist: posteriors} = vae_encoder_predict.(vae_encoder_params, images)
-    latents = Nx.multiply(sample(posteriors), 0.18215)
+    {sample, new_key} = sample(key, posteriors) |> print_value(label: "{sample, new_key}")
+    latents = Nx.multiply(sample, 0.18215) |> print_value(label: "latents")
     # Sample noise that we'll add to the latents
-    {noise, new_key} = Nx.Random.normal(key, shape: latents)
+    {noise, new_key} = Nx.Random.normal(new_key, shape: latents)
     batch_size = Nx.axis_size(latents, 0)
     # Sample a random timestep for each image
     {timesteps, new_key} =
@@ -386,23 +404,28 @@ defmodule TextualInversion do
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)
-    noisy_latents = Noiser.add_noise(scheduler_state, latents, noise, timesteps)
+    noisy_latents =
+      Noiser.add_noise(scheduler_state, latents, noise, timesteps)
+      |> print_value(label: "noisy_latents")
+
     # Get the text embedding for conditioning
     %{"input_ids" => input_ids} = text
 
     {loss, gradients} =
       value_and_grad(
-        clip_params,
-        fn params ->
+        token_embedding,
+        fn token_embedding ->
           objective_fn(
-            params,
+            token_embedding,
+            token_id,
             input_ids,
             timesteps,
             noise,
             noisy_latents,
             unet_predict,
             unet_params,
-            clip_predict
+            clip_predict,
+            clip_params
           )
         end
       )
@@ -411,16 +434,18 @@ defmodule TextualInversion do
   end
 end
 
-{init_fn, optimizer} = Axon.Optimizers.adamw(5.0e-4, decay: 0.01)
-# {init_fn, optimizer} = Axon.Optimizers.adamw(5.0e-5)
-initial_optim_state = init_fn.(clip.params)
-
 batch_step = fn batch, state ->
-  %{key: key, clip_params: clip_params, optimizer_state: optim_state} = state
+  %{
+    key: key,
+    token_embedding: token_embedding,
+    optimizer_state: optim_state,
+    accum_grads: accum_grads
+  } = state
 
   {{loss, new_key}, gradients} =
     TextualInversion.get_loss_and_grad(
-      clip_params,
+      token_embedding,
+      Nx.to_number(starting_token_id),
       batch,
       key,
       vae_encoder_predict,
@@ -429,41 +454,102 @@ batch_step = fn batch, state ->
       unet.params,
       scheduler_state,
       clip_predict,
+      clip.params,
       scheduler: scheduler
     )
 
-  {updates, new_optim_state} = optimizer.(gradients, optim_state, clip_params)
-  # Now we need to zero out all the updates in the text embedding except for our specific token
-  proper_updates =
-    Nx.broadcast(0.0, Nx.shape(updates["text_model.embeddings.token_embedding"]["kernel"]))
-    |> Nx.put_slice(
-      [Nx.to_number(starting_token_id), 0],
-      Nx.new_axis(
-        updates["text_model.embeddings.token_embedding"]["kernel"][starting_token_id],
-        0
-      )
-    )
+  IO.inspect(Nx.abs(gradients) |> Nx.sum(), label: "grads abs sum")
+  accum_grads = [gradients | accum_grads]
 
-  proper_updates =
-    put_in(updates, ["text_model.embeddings.token_embedding", "kernel"], proper_updates)
+  {new_token_embedding, accum_grads} =
+    if Enum.count(accum_grads) == 4 do
+      avg_gradients = Nx.mean(Nx.stack(accum_grads), axes: [0])
+      new_token_embedding = Nx.multiply(5.0e-4 * 4, avg_gradients) |> Nx.add(token_embedding)
+      {new_token_embedding, []}
+    else
+      {token_embedding, accum_grads}
+    end
+
+  # This isn't working for some reason: ** (ArgumentError) unable to merge arguments with incompatible structure
+  # {token_embedding_updates, new_optim_state} = optimizer.(gradients, optim_state, token_embedding)
 
   # Apply updates seems to have a bug and require a state map
-  new_clip_params = Axon.Updates.apply_updates(clip_params, proper_updates, %{})
-  %{key: new_key, clip_params: new_clip_params, optimizer_state: new_optim_state, loss: loss}
+  # new_token_embedding = Axon.Updates.apply_updates(token_embedding, token_embedding_updates, %{})
+  %{
+    key: new_key,
+    token_embedding: new_token_embedding,
+    # optimizer_state: new_optim_state,
+    optimizer_state: optim_state,
+    loss: loss,
+    accum_grads: accum_grads
+  }
 end
 
 # WEIRD BEHAVIOR: If I put the below call in a separate cell, we run out of memory while training
 
-batch_step.(Enum.at(train_data, 0), %{
-  key: Nx.Random.key(1),
-  clip_params: clip.params,
-  optimizer_state: initial_optim_state,
-  loss: 0.0
-})
+state =
+  batch_step.(Enum.at(train_data, 0), %{
+    key: Nx.Random.key(1),
+    token_embedding: token_embedding,
+    optimizer_state: initial_optim_state,
+    loss: 0.0,
+    accum_grads: []
+  })
 ```
 
 ```elixir
+token_id = Nx.to_number(starting_token_id)
 
+{images, text} = Enum.at(train_data, 0)
+%{latent_dist: posteriors} = vae_encoder_predict.(vae_encoder.params, images)
+{sample, new_key} = TextualInversion.sample(Nx.Random.key(0), posteriors)
+latents = Nx.multiply(sample, 0.18215)
+latents_mean = latents |> Nx.abs() |> Nx.mean() |> IO.inspect(label: "latents mean")
+# Sample noise that we'll add to the latents
+{noise, new_key} = Nx.Random.normal(new_key, shape: latents)
+batch_size = Nx.axis_size(latents, 0)
+# Sample a random timestep for each image
+{timesteps, new_key} =
+  Nx.Random.randint(new_key, 0, scheduler.num_train_steps, shape: {batch_size}, type: :u32)
+
+# Add noise to the latents according to the noise magnitude at each timestep
+# (this is the forward diffusion process)
+noisy_latents =
+  Noiser.add_noise(scheduler_state, latents, noise, timesteps)
+  |> IO.inspect(label: "noisy_latents")
+
+noisy_latents_mean =
+  noisy_latents |> Nx.abs() |> Nx.mean() |> IO.inspect(label: "noisy latents mean")
+
+# Get the text embedding for conditioning
+%{"input_ids" => input_ids} = text
+clip_params = TextualInversion.insert_embedding(clip.params, token_embedding, token_id)
+%{prediction: %{hidden_state: encoder_hidden_states}} = clip_predict.(clip_params, input_ids)
+encoder_hidden_states = encoder_hidden_states |> IO.inspect(label: "encoder hidden states")
+encoder_hidden_states |> Nx.abs() |> Nx.mean() |> IO.inspect(label: "encoder hidden states mean")
+
+%{sample: noise_pred} =
+  unet_predict.(unet.params, %{
+    "timestep" => timesteps,
+    "sample" => noisy_latents,
+    "encoder_hidden_state" => encoder_hidden_states
+  })
+
+noise_pred = noise_pred |> IO.inspect(label: "noise pred")
+noise_pred |> Nx.abs() |> Nx.mean() |> IO.inspect(label: "noise pred mean")
+target = noise
+# Axon.Losses.mean_squared_error and Pytorch MSELoss operate differently when reduction=:none
+loss =
+  target
+  |> Nx.subtract(noise_pred)
+  |> Nx.power(2)
+  |> Nx.mean(axes: [1, 2, 3])
+  |> Nx.mean()
+  |> IO.inspect(label: "loss")
+```
+
+```elixir
+Nx.subtract(state.token_embedding, token_embedding) |> Nx.abs() |> Nx.sum()
 ```
 
 ```elixir
@@ -524,20 +610,24 @@ Never mind! Not sure why that doesn't work :(, but I guess we'll proceed without
 ```elixir
 initial_state = %{
   key: Nx.Random.key(0),
-  clip_params: clip.params,
+  token_embedding: token_embedding,
   optimizer_state: initial_optim_state,
-  loss: 0.0
+  loss: 0.0,
+  accum_grads: []
 }
 
 final_state =
-  Enum.reduce(1..trunc(num_epochs), initial_state, fn epoch, state ->
+  Enum.reduce(1..num_epochs, initial_state, fn epoch, state ->
     IO.puts("Epoch #{epoch}")
     state = Enum.reduce(train_data, state, batch_step)
 
     IO.inspect(
-      state[:clip_params]["text_model.embeddings.token_embedding"]["kernel"][starting_token_id]
-      |> Nx.sum()
+      Nx.subtract(state[:token_embedding], token_embedding)
+      |> Nx.abs()
+      |> Nx.mean()
     )
+
+    IO.inspect(state[:loss])
 
     # renderer_handler.(%{epoch: epoch, step_state: state})
     state
@@ -545,32 +635,128 @@ final_state =
 ```
 
 ```elixir
-render_example = fn clip_params ->
-  clip = %{model: frozen_clip, params: clip_params}
+{:ok, vae_decoder} =
+  Bumblebee.load_model({:hf, repository_id, subdir: "vae"},
+    architecture: :decoder,
+    params_filename: "diffusion_pytorch_model.bin"
+  )
+```
+
+```elixir
+{:ok, scheduler} = Bumblebee.load_scheduler({:hf, repository_id, subdir: "scheduler"})
+
+render_example = fn token_embedding, prompt ->
+  clip_params =
+    TextualInversion.insert_embedding(
+      clip.params,
+      token_embedding,
+      Nx.to_number(starting_token_id)
+    )
+
+  new_clip = %{clip | params: clip_params}
 
   serving =
     Bumblebee.Diffusion.StableDiffusion.text_to_image(
-      clip,
+      new_clip,
       unet,
       vae_decoder,
       tokenizer,
       scheduler,
       num_steps: 20,
-      num_images_per_prompt: 2,
+      num_images_per_prompt: 1,
       safety_checker: nil,
       safety_checker_featurizer: nil,
-      compile: [batch_size: 1, sequence_length: 60],
+      compile: [batch_size: 1, sequence_length: 77],
       defn_options: [compiler: EXLA],
-      seed: 0
+      seed: 1,
+      guidance_scale: 7.5
     )
 
-  output = Nx.Serving.run(serving, "toy")
+  output = Nx.Serving.run(serving, prompt)
 
   for result <- output.results do
     Kino.Image.new(result.image)
   end
-  |> Kino.Layout.grid(columns: 2)
+  |> Kino.Layout.grid(columns: 1)
 end
 
-render_example.(final_state[:clip_params])
+render_example.(Nx.multiply(final_state[:token_embedding], 5), "toy") |> Kino.render()
+
+render_example.(
+  clip.params["text_model.embeddings.token_embedding"]["kernel"][starting_token_id],
+  "toy"
+)
+|> Kino.render()
 ```
+
+```elixir
+clip_params =
+  TextualInversion.insert_embedding(
+    clip.params,
+    final_state.token_embedding,
+    Nx.to_number(starting_token_id)
+  )
+
+Nx.subtract(
+  clip.params["text_model.embeddings.token_embedding"]["kernel"],
+  clip_params["text_model.embeddings.token_embedding"]["kernel"]
+)
+|> Nx.abs()
+|> Nx.sum()
+|> Kino.render()
+
+Nx.subtract(
+  clip.params["text_model.embeddings.token_embedding"]["kernel"][starting_token_id],
+  clip_params["text_model.embeddings.token_embedding"]["kernel"][starting_token_id]
+)
+|> Nx.abs()
+|> Nx.mean()
+|> Kino.render()
+
+Nx.subtract(
+  clip.params["text_model.embeddings.token_embedding"]["kernel"][
+    Nx.subtract(starting_token_id, 1)
+  ],
+  clip.params["text_model.embeddings.token_embedding"]["kernel"][
+    Nx.subtract(starting_token_id, 2)
+  ]
+)
+|> Nx.abs()
+|> Nx.mean()
+|> Kino.render()
+
+Nx.sum(Nx.abs(clip.params["text_model.embeddings.token_embedding"]["kernel"][starting_token_id]))
+|> Kino.render()
+
+Nx.subtract(
+  clip.params["text_model.encoder.layers.2.self_attn.k_proj"]["kernel"],
+  clip_params["text_model.encoder.layers.2.self_attn.k_proj"]["kernel"]
+)
+|> Nx.abs()
+|> Nx.sum()
+```
+
+```elixir
+Bumblebee.apply_tokenizer(tokenizer, "a toy",
+  length: 60,
+  return_token_type_ids: false,
+  return_attention_mask: false
+)
+|> Kino.render()
+
+starting_token_id
+```
+
+```elixir
+scheduler_state.timesteps
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Get values
+
+TODO:
+
+* Try getting training params on the fly
+* Send scheduler steps as a number
+* turn things into maps
